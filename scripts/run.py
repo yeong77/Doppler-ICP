@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # MIT License
 #
 # Copyright (c) 2022 Aeva, Inc
@@ -47,135 +47,197 @@ Example usage:
         -s 100 -e 150 -m point_to_plane
 """
 
+import rclpy
+from rclpy.node import Node
 import argparse
 import os
 import sys
 import traceback
 from os.path import basename, dirname, isdir, join, realpath
-
 import numpy as np
-from tqdm import tqdm
+import open3d as o3d
+
 
 import registration
 import utils
 
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import TransformStamped, PoseStamped
+from tf2_ros import TransformBroadcaster
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy, QoSDurabilityPolicy
 
-def run(args):
-    # Convert args to dict.
-    params = vars(args)
+import tf_transformations as tf
 
-    if isdir(args.sequence):
-        # Directory mode.
-        seq_dir = args.sequence
-        args.sequence = basename(args.sequence)
-    else:
-        # Sequence name mode.
-        script_dir = dirname(realpath(sys.argv[0]))
-        seq_dir = join(join(dirname(script_dir), 'dataset'), args.sequence)
+class DopplerICPRealtime(Node):
+    def __init__(self, args):
+        super().__init__('realtime_doppler_icp_node')
+        self.args = args
+        self.params = vars(args)
+        self.icp_method = registration.doppler_icp if args.method == 'doppler' else registration.point_to_plane_icp
 
-    assert isdir(seq_dir), 'Sequence: %s not found' % args.sequence
+        self.prev_pcd = None
+        self.prev_pose = np.eye(4)
+        self.results = {
+            'poses': [np.eye(4)],
+            'timestamps': [],
+            'convergence': [],
+            'iterations': []
+        }
 
-    # Extract the paths to all the point cloud scans.
-    pcd_files = utils.load_point_cloud_filenames(join(seq_dir, 'point_clouds'))
-    print('Loaded sequence: %s with %d scans' % (args.sequence, len(pcd_files)))
+        self.params['T_V_to_S'] = np.eye(4)
+        self.params['period'] = 0.1  # 실시간 주기 (수정 가능)
 
-    # Load the reference poses (for evaluation) and calibration parameters.
-    ref_poses, timestamps = utils.load_tum_poses(join(seq_dir, 'ref_poses.txt'))
-    params['T_V_to_S'] = utils.load_calibration(seq_dir)
+        self.odom_pub = self.create_publisher(Odometry, '/odom', 1)
+        self.path_pub = self.create_publisher(Path, '/trajectory', 10)
+        self.tf_broadcaster = TransformBroadcaster(self)
 
-    # Picks the specified registration algorithm (Point-to-Plane vs DICP).
-    icp_method = registration.doppler_icp if args.method == 'doppler' else \
-                 registration.point_to_plane_icp
 
-    results = {
-        'poses': [np.eye(4)],
-        'ref_poses': [np.eye(4)],
-        'timestamps': [timestamps[args.start]],
-        'convergence': [],
-        'iterations': [],
-        'translation_rpe': [],
-        'rotation_rpe': [],
-    }
+        qos_profile = QoSProfile(
+                        history=QoSHistoryPolicy.KEEP_LAST,
+                        depth=1,
+                        reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                        durability=QoSDurabilityPolicy.VOLATILE
+                        )
+        self.create_subscription(PointCloud2, "/aeva/pointcloud", self.callback, qos_profile)
 
-    success = True
-    if args.end < 0: args.end = len(pcd_files) - 1
-    for i in tqdm(range(args.start, args.end), initial=1, desc='Processing'):
-        # Load the point cloud into Open3D format (without any pre-processing).
-        source = utils.load_point_cloud(pcd_files[i])
-        target = utils.load_point_cloud(pcd_files[i + 1])
+        self.map_pcd = o3d.geometry.PointCloud()
+        self.map_pub = self.create_publisher(PointCloud2, '/map', 1)
+        self.path_msg = Path()
+        self.path_msg.header.frame_id = "odom"
 
-        # Compute the relative pose (for reference/ground-truth).
-        ref_transform = utils.relative_pose(ref_poses[i + 1], ref_poses[i])
-        params['period'] = timestamps[i + 1] - timestamps[i]
+    def pointcloud2_to_o3d(self, msg):
+        raw_points = np.array(list(point_cloud2.read_points(msg, field_names=("x", "y", "z", "velocity"), skip_nans=True)), dtype=[
+        ('x', np.float32), ('y', np.float32), ('z', np.float32), ('velocity', np.float32)
+        ])
 
-        # If the seed flag is set, the previous estimated pose in the sequence
-        # is used to seed ICP under a constant-velocity motion assumption.
-        init_transform = results['poses'][-1] if args.seed else np.eye(4)
+        if raw_points.shape[0] == 0:
+            self.get_logger().warn("PointCloud is empty.")
+            return None
 
+        xyz_points = np.zeros((raw_points.shape[0], 3), dtype=np.float32)
+        xyz_points[:, 0] = raw_points['x']     # structured array -> (N, 3) Numpy array로 변경 
+        xyz_points[:, 1] = raw_points['y']
+        xyz_points[:, 2] = raw_points['z']
+
+        doppler_values = raw_points['velocity'] # doppler value 추가 
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(xyz_points) 
+        pcd.dopplers = o3d.utility.DoubleVector(doppler_values.tolist())
+        
+        return pcd
+
+    def callback(self, msg):
+        target = self.pointcloud2_to_o3d(msg)
+        if self.prev_pcd is None:
+            self.prev_pcd = target
+            stamp = msg.header.stamp
+            time_in_sec = stamp.sec + stamp.nanosec * 1e-9
+            self.results['timestamps'].append(time_in_sec)
+            return
+        
+        
+        init_transform = self.results['poses'][-1] if self.args.seed else np.eye(4)
+        
+        print("cccc")   
         try:
-            result = icp_method(source, target, params, init_transform)
-        except Exception:
-            print('FATAL: Failed to run ICP, terminating sequence')
-            print(traceback.format_exc())
-            success = False
-            break
+            result = self.icp_method(self.prev_pcd, target, self.params, init_transform)
+            print("aaaa")
 
-        # Computes the relative poses errors wrt to the reference pose.
-        # Based on: D. Prokhorov et al., Measuring robustness of Visual SLAM.
-        trans_rpe, rot_rpe = utils.relative_pose_error(result.transformation,
-                                                       ref_transform,
-                                                       degrees=True)
+        except Exception as e:
+            rclpy.logwarn("ICP Failed: %s" % e)
+            return
+        
+        T_rel = np.linalg.inv(result.transformation)
+        curr_pose = self.results['poses'][-1] @ T_rel
+        
+        # 🔧 여기에서 바로 정규 직교화
+        R, t = curr_pose[:3, :3], curr_pose[:3, 3]
+        u, _, vh = np.linalg.svd(R)
+        R_orthogonal = u @ vh
+        curr_pose[:3, :3] = R_orthogonal
+        curr_pose[:3, 3] = t  # 위치는 그대로 유지
 
-        # Store inverse poses which represent odometry.
-        results['poses'].append(np.linalg.inv(result.transformation))
-        results['ref_poses'].append(np.linalg.inv(ref_transform))
-        results['timestamps'].append(timestamps[i + 1])
-        results['convergence'].append(result.converged)
-        results['iterations'].append(result.num_iterations)
-        results['translation_rpe'].append(trans_rpe)
-        results['rotation_rpe'].append(rot_rpe)
+        self.results['poses'].append(curr_pose)
 
-        if args.gui:
-            utils.display_registration(source, target, result.transformation, i)
+        #target point cloud 다운샘플링 후 transform
+        target_down = target.voxel_down_sample(voxel_size=0.01)
+        target_in_map = o3d.geometry.PointCloud(target)
+        target_in_map.transform(curr_pose)
+        
+        #누적
+        self.map_pcd += target_in_map
 
-    sys.stdout.flush()
+        if len(self.map_pcd.points) > 500000:
+            self.map_pcd = self.map_pcd.voxel_down_sample(voxel_size=0.1)
+            
+        self.publish_map(self.map_pcd, msg.header)
 
-    # Compute the total path length using the relative poses.
-    icp_path = utils.path_length(np.array(results['poses']))
-    ref_path = utils.path_length(np.array(results['ref_poses']))
+        self.prev_pcd = target
 
-    print('-' * 40)
-    print(('Sequence: %s' % args.sequence).center(40))
-    print('-' * 40)
-    print('Translation RPE (m): %.4f' % utils.rmse(results['translation_rpe']))
-    print('Rotation RPE (deg): %.4f' % np.mean(results['rotation_rpe']))
-    print('Estimated path length (m): %.2f' % icp_path)
-    print('Reference path length (m): %.2f' % ref_path)
-    print('Path length error (m): %.2f' % np.abs(icp_path - ref_path))
-    print('Average iterations: %.1f' % np.mean(results['iterations']))
-    print('Convergence rate: %.1f%%' % (np.mean(results['convergence']) * 100))
-    print('-' * 40)
+        self.publish_odometry(curr_pose)
 
-    # Save all the registration data to visualize or evaluate later using evo.
-    os.makedirs(args.output_dir, exist_ok=True)
-    np.savez_compressed(join(args.output_dir, 'registration_data.npz'),
-                        args=args, results=results)
+    def publish_map(self, pcd, header):
+        points = np.asarray(pcd.points)
+        map_msg = point_cloud2.create_cloud_xyz32(header, points)
+        map_msg.header.frame_id = "map"
+        self.map_pub.publish(map_msg)
 
-    # Save the trajectory from ICP in TUM format.
-    utils.export_tum_poses(join(args.output_dir, 'icp_poses.txt'),
-                           results['poses'], results['timestamps'])
+    def publish_odometry(self, pose):
 
-    # Emit exit code on failure.
-    exit(not success)
+        trans = pose[:3, 3]
+        quat = tf.quaternion_from_matrix(pose)
+        
+        now = self.get_clock().now().to_msg()
+
+        odom = Odometry()
+        odom.header.stamp = now
+        odom.header.frame_id = "odom"
+        odom.child_frame_id = "aeva_frame"
+
+        odom.pose.pose.position.x = trans[0]
+        odom.pose.pose.position.y = trans[1]
+        odom.pose.pose.position.z = trans[2]
+        odom.pose.pose.orientation.x = quat[0]
+        odom.pose.pose.orientation.y = quat[1]
+        odom.pose.pose.orientation.z = quat[2]
+        odom.pose.pose.orientation.w = quat[3]
+
+        self.odom_pub.publish(odom)
+        
+        t = TransformStamped()
+        t.header.stamp = now
+        t.header.frame_id = "odom"
+        t.child_frame_id = "aeva_frame"
+        t.transform.translation.x = trans[0]
+        t.transform.translation.y = trans[1]
+        t.transform.translation.z = trans[2]
+        t.transform.rotation.x = quat[0]
+        t.transform.rotation.y = quat[1]
+        t.transform.rotation.z = quat[2]
+        t.transform.rotation.w = quat[3]
+
+        self.tf_broadcaster.sendTransform(t)
+
+        pose_stamped = PoseStamped()
+        pose_stamped.header.stamp = now
+        pose_stamped.header.frame_id = "odom"
+        pose_stamped.pose = odom.pose.pose
+
+        
+        self.path_msg.header.stamp = now
+        self.path_msg.poses.append(pose_stamped)
+        self.path_pub.publish(self.path_msg)
+
+        
+
+
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--sequence', type=str, default='sample',
-                        help='Sequence name from the dataset or the absolute'
-                             ' path to the sequence directory')
-    parser.add_argument('--output_dir', '-o', type=str, required=True,
-                        help='Directory to save the registration results at')
     parser.add_argument('--start', '-s', type=int, default=0,
                         help='Start frame index (inclusive)')
     parser.add_argument('--end', '-e', type=int, default=-1,
@@ -228,7 +290,14 @@ def parse_args():
     return parser.parse_args()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     args = parse_args()
-    print('PID: [%d]' % os.getpid())
-    run(args)
+    rclpy.init()
+    node = DopplerICPRealtime(args)
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
